@@ -25,6 +25,8 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <sys/time.h>   // settimeofday
+
 
 #include <PN532_I2C.h>
 #include <PN532.h>              // Elechouse PN532
@@ -78,9 +80,9 @@ uint8_t  QUIET_START_H     = 22;
 uint8_t  QUIET_END_H       = 7;
 
 // Optional WiFi for NTP (only needed if QUIET_EN true)
-const char* WIFI_SSID      = "";
-const char* WIFI_PASSWORD  = "";
-const char* TZ_STRING      = "EST5EDT,M3.2.0/2,M11.1.0/2";
+const char* WIFI_SSID      = "Slewfoot";
+const char* WIFI_PASSWORD  = "BluegrassRules4";
+String SET_TZ              = "EST5EDT,M3.2.0/2,M11.1.0/2";
 
 // ---- Last tag tracking ----
 String   lastUidHex = "";
@@ -224,6 +226,7 @@ void saveAll(){
   prefs.putString("code", UNLOCK_CODE);
   prefs.putUInt("sleep_ms", SET_SLEEP_MS);
   prefs.putUInt("day_fallback_ms", SET_DAY_FALLBACK_MS);
+  prefs.putString("tz", SET_TZ);
 
   prefs.putBool("quiet_en", QUIET_EN);
   prefs.putUChar("q_start", QUIET_START_H);
@@ -246,6 +249,7 @@ void loadAll(){
   UNLOCK_CODE       = prefs.getString("code", UNLOCK_CODE);
   SET_SLEEP_MS      = prefs.getUInt("sleep_ms", SET_SLEEP_MS);
   SET_DAY_FALLBACK_MS = prefs.getUInt("day_fallback_ms", SET_DAY_FALLBACK_MS);
+  SET_TZ            = prefs.getString("tz", SET_TZ);
   QUIET_EN       = prefs.getBool("quiet_en", QUIET_EN);
   QUIET_START_H  = prefs.getUChar("q_start", QUIET_START_H);
   QUIET_END_H    = prefs.getUChar("q_end",   QUIET_END_H);
@@ -462,7 +466,7 @@ bool ensureTimeSync(uint32_t wifiMs=6000, uint32_t ntpMs=3000){
   uint32_t t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<wifiMs) delay(100);
   if (WiFi.status()!=WL_CONNECTED){ WiFi.disconnect(true,true); WiFi.mode(WIFI_OFF); return false; }
   configTime(0,0,"pool.ntp.org","time.nist.gov");
-  setenv("TZ", TZ_STRING, 1); tzset();
+  setenv("TZ", SET_TZ.c_str(), 1); tzset();
   tm tmp{}; uint32_t t1=millis();
   while(millis()-t1<ntpMs){ if(getLocalTime(&tmp)){ timeValid=true; break; } delay(100); }
   WiFi.disconnect(true,true); WiFi.mode(WIFI_OFF);
@@ -581,6 +585,23 @@ void applyKV(String k, String v, AdminResult &ar){
   else if (k=="clear")         { if(v=="1"||v=="true"){ clearAllow(); ar.msg="cleared"; } else { ar.ok=false; ar.msg="clear?"; } }
   else if (k=="sleep_ms")      { long x=v.toInt(); if(x<30000) x=30000; SET_SLEEP_MS=(uint32_t)x; ar.msg="sleep_ms"; }
   else if (k=="day_fallback_ms"){ long x=v.toInt(); if(x<0) x=0; SET_DAY_FALLBACK_MS=(uint32_t)x; ar.msg="day_fallback_ms"; }
+    else if (k=="datetime") { // e.g. datetime=2025-11-11 21:03:00 or 2025-11-11T21:03:00
+    if (setClockFromString(v)){ ar.msg="datetime"; }
+    else { ar.ok=false; ar.msg="datetime parse"; }
+  }
+  else if (k=="epoch") {    // e.g. epoch=1731364980
+    long long e = strtoll(v.c_str(), nullptr, 10);
+    if (setClockFromEpoch((time_t)e)){ ar.msg="epoch"; }
+    else { ar.ok=false; ar.msg="epoch bad"; }
+  }
+  else if (k=="tz") {       // e.g. tz=EST5EDT,M3.2.0/2,M11.1.0/2
+    if (v.length()){
+      SET_TZ = v; saveAll();
+      setenv("TZ", SET_TZ.c_str(), 1); tzset();
+      ar.msg="tz";
+    } else { ar.ok=false; ar.msg="tz empty"; }
+  }
+
   else { ar.ok=false; ar.msg = "unk key: "+k; }
 }
 
@@ -651,6 +672,55 @@ void enterDeepSleep_NightTimer(){
   esp_deep_sleep_start();
 }
 
+// Small OLED toast line (1–2s)
+static void oledToast(const char* line1, const char* line2 = nullptr, uint16_t ms=1200){
+  displayWake();
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(6, 20); display.println(line1 ? line1 : "");
+  if (line2){ display.setCursor(6, 34); display.println(line2); }
+  display.display();
+  delay(ms);
+}
+
+// Set RTC from UNIX epoch seconds
+static bool setClockFromEpoch(time_t epoch){
+  if (epoch <= 0) return false;
+  struct timeval tv; tv.tv_sec = epoch; tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  setenv("TZ", SET_TZ.c_str(), 1); tzset();   // apply TZ to localtime conversion
+  timeValid = true;
+  return true;
+}
+
+// Parse "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS"
+static bool setClockFromString(const String& s){
+  int Y,M,D,h,m,sec;
+  if (sscanf(s.c_str(), "%d-%d-%d %d:%d:%d", &Y,&M,&D,&h,&m,&sec) != 6 &&
+      sscanf(s.c_str(), "%d-%d-%dT%d:%d:%d", &Y,&M,&D,&h,&m,&sec) != 6) {
+    return false;
+  }
+  struct tm t = {};
+  t.tm_year = Y - 1900; t.tm_mon = M - 1; t.tm_mday = D;
+  t.tm_hour = h; t.tm_min = m; t.tm_sec = sec;
+  // mktime expects local time per current TZ:
+  setenv("TZ", SET_TZ.c_str(), 1); tzset();
+  time_t epoch = mktime(&t);
+  if (epoch <= 0) return false;
+  return setClockFromEpoch(epoch);
+}
+
+// Pretty-print current local time to Serial (and option to return string)
+static String nowString(){
+  tm now{};
+  if (getLocalTime(&now, 200)) {
+    char b[40]; strftime(b, sizeof(b), "%F %T", &now);
+    return String(b);
+  }
+  return String("unknown");
+}
+
 
 // ---------------- Serial commands ----------------
 void printShow(){
@@ -670,13 +740,17 @@ void handleSerial(){
       "  show\n"
       "  list | add <UIDHEX> | remove <UIDHEX> | clear\n"
       "  active_ms <ms> | welcome_ms <ms> | reject_ms <ms> | marquee_ms <ms> | code_delay_ms <ms>\n"
+      "  sleep_ms <ms> | day_fallback_ms <ms>\n"
       "  unlock <4digits>\n"
       "  quiet on|off [start end]\n"
-      "  time | ntp\n"
+      "  time | date | ntp\n"
+      "  settime YYYY-MM-DD HH:MM:SS | setepoch <unix> | settz <POSIX_TZ> | tz\n"
+      "  last | lastgranted | addlast\n"
       "  i2cscan | pnreset | pninfo\n"
       "  sleepdiag | irq | sleepnow");
     return;
   }
+
   if (line=="show"){ printShow(); return; }
   if (line=="list"){ for(uint8_t i=0;i<allowCount;i++) Serial.println(allowUids[i]); return; }
   if (line.startsWith("add ")){ String h=line.substring(4); h.trim(); h.toUpperCase(); h.replace(" ",""); Serial.println(addAllow(h)?"ok":"fail/full"); saveAll(); return; }
@@ -713,6 +787,66 @@ void handleSerial(){
     else Serial.println("time unknown");
     return;
   }
+
+    // --- time / date reporting (alias) ---
+  if (line=="time" || line=="date"){
+    String s = nowString();
+    Serial.print("now "); Serial.println(s);
+    return;
+  }
+
+  // --- settime YYYY-MM-DD HH:MM:SS (or YYYY-MM-DDTHH:MM:SS) ---
+  if (line.startsWith("settime ")){
+    String ts = line.substring(8); ts.trim();
+    bool ok = setClockFromString(ts);
+    if (ok){
+      String s = nowString();
+      Serial.printf("time set: %s (tz=%s)\n", s.c_str(), SET_TZ.c_str());
+      oledToast("TIME SET", s.c_str());
+    } else {
+      Serial.println("time parse fail (use: settime 2025-11-11 21:03:00)");
+      oledToast("TIME PARSE FAIL");
+    }
+    return;
+  }
+
+  // --- setepoch <unix_seconds> ---
+  if (line.startsWith("setepoch ")){
+    long long v = strtoll(line.substring(9).c_str(), nullptr, 10);
+    bool ok = setClockFromEpoch((time_t)v);
+    if (ok){
+      String s = nowString();
+      Serial.printf("epoch set: %lld -> %s (tz=%s)\n", v, s.c_str(), SET_TZ.c_str());
+      oledToast("EPOCH SET", s.c_str());
+    } else {
+      Serial.println("epoch set fail");
+      oledToast("EPOCH SET FAIL");
+    }
+    return;
+  }
+
+  // --- settz <POSIX_TZ_string> (persists) ---
+  if (line.startsWith("settz ")){
+    String tz = line.substring(6); tz.trim();
+    if (tz.length()==0){ Serial.println("usage: settz EST5EDT,M3.2.0/2,M11.1.0/2"); return; }
+    SET_TZ = tz; saveAll();
+    setenv("TZ", SET_TZ.c_str(), 1); tzset();
+    // If we already had a valid clock, re-print in the new TZ
+    String s = nowString();
+    Serial.printf("tz set: %s\n", SET_TZ.c_str());
+    oledToast("TZ SET", SET_TZ.c_str());
+    if (s != "unknown") Serial.printf("now %s\n", s.c_str());
+    return;
+  }
+
+  // --- tz (show current TZ string) ---
+  if (line=="tz"){
+    Serial.printf("tz=%s\n", SET_TZ.c_str());
+    return;
+  }
+
+
+
   if (line=="ntp"){ Serial.println(ensureTimeSync()?"synced":"fail"); return; }
 
   if (line=="sleepdiag"){
