@@ -90,6 +90,9 @@ uint8_t  lastUidLen = 0;
 bool     lastWasRecognized = false;   // whether the *last* read matched allowlist
 String   lastGrantedHex = "";         // last UID that actually unlocked
 
+// Survives deep sleep resets (lives in RTC slow memory)
+RTC_DATA_ATTR time_t gPlannedWakeEpoch = 0;   // when we *intended* to wake
+RTC_DATA_ATTR uint32_t gLastSyncEpoch = 0;    // last time we successfully synced (optional telemetry)
 
 // ---------------- Allowlist ----------------
 const uint8_t MAX_UIDS = 16;
@@ -184,6 +187,20 @@ void pnInfo() {
   else   Serial.println("PN532 not responding");
 }
 
+static void setSystemTimeFromEpoch(time_t epoch, const char* tag){
+  if (epoch <= 0) return;
+  struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+  settimeofday(&tv, nullptr);
+  setenv("TZ", TZ_STRING, 1); tzset();
+  timeValid = true;
+  tm tmp{}; 
+  if (getLocalTime(&tmp)) {
+    char b[40]; strftime(b,sizeof(b),"%F %T",&tmp);
+    Serial.print("[TIME] set from "); Serial.print(tag); Serial.print(": "); Serial.println(b);
+  } else {
+    Serial.println("[TIME] set from fallback epoch (no local time yet)");
+  }
+}
 
 // ---------------- Helpers: UID formatting ----------------
 String uidHexNoSep(const uint8_t* uid, uint8_t len){
@@ -458,20 +475,73 @@ void pn532PowerUp(){
 }
 
 // ---------------- Time helpers (quiet hours) ----------------
-bool ensureTimeSync(uint32_t wifiMs=6000, uint32_t ntpMs=3000){
-  if (!QUIET_EN) return false;
-  // Radios OFF by default; briefly bring WiFi up just for time
+bool ensureTimeSync(uint32_t wifiMs=10000, uint32_t ntpMs=10000, bool force=false, bool verbose=true){
+  // Try even if quiet is disabled if 'force' is true
+  if (!force && !QUIET_EN) {
+    if (verbose) Serial.println("[NTP] skipped (quiet disabled)");
+    return false;
+  }
+
+  if (verbose) Serial.println("[NTP] start");
+
+  // Bring WiFi up just for sync, then turn it back off
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(50);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  uint32_t t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<wifiMs) delay(100);
-  if (WiFi.status()!=WL_CONNECTED){ WiFi.disconnect(true,true); WiFi.mode(WIFI_OFF); return false; }
-  configTime(0,0,"pool.ntp.org","time.nist.gov");
-  setenv("TZ", SET_TZ.c_str(), 1); tzset();
-  tm tmp{}; uint32_t t1=millis();
-  while(millis()-t1<ntpMs){ if(getLocalTime(&tmp)){ timeValid=true; break; } delay(100); }
-  WiFi.disconnect(true,true); WiFi.mode(WIFI_OFF);
+
+  uint32_t t0 = millis();
+  while (WiFi.status()!=WL_CONNECTED && millis()-t0 < wifiMs) {
+    delay(100);
+  }
+  if (WiFi.status()!=WL_CONNECTED) {
+    if (verbose) Serial.println("[NTP] WiFi connect failed");
+    WiFi.mode(WIFI_OFF);
+    return false;
+  }
+
+  if (verbose) {
+    Serial.print("[NTP] WiFi OK, IP="); Serial.println(WiFi.localIP());
+    Serial.print("[NTP] RSSI="); Serial.println(WiFi.RSSI());
+    Serial.println("[NTP] DNS test...");
+  }
+
+  IPAddress ip;
+  if (!WiFi.hostByName("pool.ntp.org", ip)) {
+    if (verbose) Serial.println("[NTP] DNS lookup failed");
+    WiFi.disconnect(true, true); WiFi.mode(WIFI_OFF);
+    return false;
+  } else if (verbose) {
+    Serial.print("[NTP] pool.ntp.org -> "); Serial.println(ip);
+  }
+
+  // Multiple servers; any one can succeed
+  configTime(0,0,"time.google.com","time.nist.gov","pool.ntp.org");
+  setenv("TZ", TZ_STRING, 1); tzset();
+
+  tm tmp{}; uint32_t t1 = millis();
+  timeValid = false;
+  while (millis()-t1 < ntpMs){
+    if (getLocalTime(&tmp)) {
+      timeValid = true;
+      gLastSyncEpoch = time(nullptr);
+      if (verbose) {
+        char b[40]; strftime(b,sizeof(b),"%F %T",&tmp);
+        Serial.print("[NTP] synced "); Serial.println(b);
+      }
+      break;
+    }
+    delay(100);
+  }
+
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+
+  if (!timeValid && verbose) Serial.println("[NTP] timed out");
   return timeValid;
 }
+
 bool inQuietHours(){
   if(!QUIET_EN) return false;
   tm now{}; if(!getLocalTime(&now)) return false;
@@ -628,49 +698,50 @@ AdminResult applyConfigText(String txt){
 
 // ---------------- Sleep entries (night only) ----------------
 void enterDeepSleep_NightTimer(){
-  // Turn off OLED and put PN532 in reset so it won't toggle IRQ
+  // Turn off OLED/PN532
   displaySleep();
   pn532PowerDown();
 
-  // Radios OFF (belt & suspenders)
+  // Radios OFF
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
-  // (BT off by default unless you enabled it elsewhere)
 
-  // Don’t allow IRQ to wake at night (and don’t inherit daytime settings)
+  // Don’t inherit daytime wakes
   disableAllWakesExceptTimer();
 
-  // Keep IRQ line quiet during deep sleep (pull HIGH). GPIO33 is RTC-capable.
+  // Keep IRQ quiet during deep sleep (pull HIGH)
   rtcHoldLevel((gpio_num_t)PN532_IRQ, 1 /*HIGH*/, true /*pullup*/);
 
-  // Work out timer to QUIET_END_H. If time is invalid, or delta is tiny, clamp.
-  if (!timeValid) {
-    (void)ensureTimeSync(4000, 2500); // best effort
-  }
+  // Try to have time; if not, we’ll still pick a reasonable nap
+  if (!timeValid) (void)ensureTimeSync(4000, 2500, /*force=*/true, /*verbose=*/true);
+
   uint64_t us = 0;
-  if (timeValid) us = microsUntilHour(QUIET_END_H);
+  time_t nowEpoch = time(nullptr);
 
-  // Robust clamps:
-  const uint64_t ONE_MIN  = 60ULL * 1000000ULL;
-  const uint64_t THIRTY_MIN = 30ULL * ONE_MIN;
+  if (timeValid) {
+    // When time is valid, schedule precise wake to QUIET_END_H
+    uint64_t toEnd = microsUntilHour(QUIET_END_H);
+    const uint64_t ONE_MIN  = 60ULL * 1000000ULL;
+    if (toEnd < ONE_MIN) toEnd = ONE_MIN; // avoid thrash near boundary
 
-  if (us == 0) {
-    // time unknown → nap for 30 minutes and try again
+    us = toEnd;
+    gPlannedWakeEpoch = nowEpoch + (time_t)(us / 1000000ULL);   // <<< store planned wake time
+  } else {
+    // No time: nap ~30 minutes and try again next boot
+    const uint64_t THIRTY_MIN = 30ULL * 60ULL * 1000000ULL;
     us = THIRTY_MIN;
-  } else if (us < ONE_MIN) {
-    // if we’re < 60s from wake boundary, don’t thrash—sleep at least 1 minute
-    us = ONE_MIN;
+    gPlannedWakeEpoch = 0; // unknown wake epoch in this case
   }
 
-  logf("[SLEEP] Night: timer to %02u:00 (%llu us). PN532 held reset, IRQ held high.\n",
-       QUIET_END_H, (unsigned long long)us);
+  logf("[SLEEP] Night: timer set (%llu us). plannedWake=%ld\n",
+       (unsigned long long)us, (long)gPlannedWakeEpoch);
 
   esp_sleep_enable_timer_wakeup(us);
 
-  // Short grace so USB prints flush
-  delay(40);
+  delay(40); // let USB prints flush
   esp_deep_sleep_start();
 }
+
 
 // Small OLED toast line (1–2s)
 static void oledToast(const char* line1, const char* line2 = nullptr, uint16_t ms=1200){
@@ -744,7 +815,7 @@ void handleSerial(){
       "  unlock <4digits>\n"
       "  quiet on|off [start end]\n"
       "  time | date | ntp\n"
-      "  settime YYYY-MM-DD HH:MM:SS | setepoch <unix> | settz <POSIX_TZ> | tz\n"
+      "  settime YYYY-MM-DD HH:MM:SS | setepoch <unix> | settz <POSIX_TZ> | tz | checknow\n"
       "  last | lastgranted | addlast\n"
       "  i2cscan | pnreset | pninfo\n"
       "  sleepdiag | irq | sleepnow");
@@ -756,6 +827,15 @@ void handleSerial(){
   if (line.startsWith("add ")){ String h=line.substring(4); h.trim(); h.toUpperCase(); h.replace(" ",""); Serial.println(addAllow(h)?"ok":"fail/full"); saveAll(); return; }
   if (line.startsWith("remove ")){ String h=line.substring(7); h.trim(); h.toUpperCase(); h.replace(" ",""); Serial.println(removeAllow(h)?"ok":"notfound"); saveAll(); return; }
   if (line=="clear"){ clearAllow(); saveAll(); Serial.println("cleared"); return; }
+  if (line=="checknow"){
+  esp_sleep_wakeup_cause_t c = esp_sleep_get_wakeup_cause();
+  bool synced = ensureTimeSync(10000, 10000, true, true);
+  if (!synced && c == ESP_SLEEP_WAKEUP_TIMER && gPlannedWakeEpoch > 0) {
+    setSystemTimeFromEpoch(gPlannedWakeEpoch, "planned-wake(manual)");
+  }
+  Serial.println(timeValid ? "time:ok" : "time:unknown");
+  return;
+  }
 
   if (line.startsWith("active_ms ")){ unsigned long v=line.substring(10).toInt(); if(v<10000UL)v=10000UL; SET_ACTIVE_MS=v; saveAll(); printShow(); return; }
   if (line.startsWith("welcome_ms ")){ unsigned long v=line.substring(11).toInt(); if(v<200UL) v=200UL; SET_WELCOME_MS=v; saveAll(); printShow(); return; }
@@ -956,14 +1036,30 @@ void setup(){
   }
 
   // If quiet enabled, try to have time available for night logic
-  if (QUIET_EN) ensureTimeSync(4000,2500);
+  if (QUIET_EN) ensureTimeSync(6000,6000);
 
-  // Wake cause diag
+   // Determine wake cause *early*
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  if (cause == ESP_SLEEP_WAKEUP_TIMER) logf("[WAKE] TIMER\n");
-  else logf("[WAKE] COLD\n");
+  if (cause == ESP_SLEEP_WAKEUP_TIMER) Serial.println("[WAKE] TIMER");
+  else                                 Serial.println("[WAKE] COLD");
 
-  // Start active with sign visible
+  // --- Boot-time time policy ---
+  // Always try NTP at boot, regardless of quiet settings
+  bool synced = ensureTimeSync(10000, 10000, /*force=*/true, /*verbose=*/true);
+
+  if (!synced && cause == ESP_SLEEP_WAKEUP_TIMER && gPlannedWakeEpoch > 0) {
+    // Couldn’t reach NTP after a night-timer wake — set time to the planned boundary
+    setSystemTimeFromEpoch(gPlannedWakeEpoch, "planned-wake");
+  }
+
+  // Optional: if still not valid but we *ever* synced before, use last known + uptime as a coarse fallback
+  if (!timeValid && gLastSyncEpoch > 0) {
+    // This is rough (drift!), but better than "unknown"
+    time_t approx = gLastSyncEpoch; // you could add millis()/1000 here, but that’s boot-relative only
+    setSystemTimeFromEpoch(approx, "last-sync-epoch");
+  }
+
+  // Start UI
   displayWake(); mode=MODE_SIGN; lastScanMs=millis();
 }
 
