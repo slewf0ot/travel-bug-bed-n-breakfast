@@ -80,8 +80,8 @@ uint8_t  QUIET_START_H     = 22;
 uint8_t  QUIET_END_H       = 7;
 
 // Optional WiFi for NTP (only needed if QUIET_EN true)
-const char* WIFI_SSID      = "Slewfoot";
-const char* WIFI_PASSWORD  = "BluegrassRules4";
+const char* WIFI_SSID      = "";
+const char* WIFI_PASSWORD  = "";
 String SET_TZ              = "EST5EDT,M3.2.0/2,M11.1.0/2";
 
 // ---- Last tag tracking ----
