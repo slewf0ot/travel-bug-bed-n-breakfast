@@ -191,7 +191,7 @@ static void setSystemTimeFromEpoch(time_t epoch, const char* tag){
   if (epoch <= 0) return;
   struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
   settimeofday(&tv, nullptr);
-  setenv("TZ", TZ_STRING, 1); tzset();
+  setenv("TZ", SET_TZ.c_str(), 1); tzset();
   timeValid = true;
   tm tmp{}; 
   if (getLocalTime(&tmp)) {
@@ -266,7 +266,7 @@ void loadAll(){
   UNLOCK_CODE       = prefs.getString("code", UNLOCK_CODE);
   SET_SLEEP_MS      = prefs.getUInt("sleep_ms", SET_SLEEP_MS);
   SET_DAY_FALLBACK_MS = prefs.getUInt("day_fallback_ms", SET_DAY_FALLBACK_MS);
-  SET_TZ            = prefs.getString("tz", SET_TZ);
+  SET_TZ            = prefs.getString("tz", "EST5EDT,M3,2.0/2,M11.1.0/2"); setenv("TZ", SET_TZ.c_str(), 1); tzset();
   QUIET_EN       = prefs.getBool("quiet_en", QUIET_EN);
   QUIET_START_H  = prefs.getUChar("q_start", QUIET_START_H);
   QUIET_END_H    = prefs.getUChar("q_end",   QUIET_END_H);
@@ -518,7 +518,7 @@ bool ensureTimeSync(uint32_t wifiMs=10000, uint32_t ntpMs=10000, bool force=fals
 
   // Multiple servers; any one can succeed
   configTime(0,0,"time.google.com","time.nist.gov","pool.ntp.org");
-  setenv("TZ", TZ_STRING, 1); tzset();
+  setenv("TZ", SET_TZ.c_str(), 1); tzset();
 
   tm tmp{}; uint32_t t1 = millis();
   timeValid = false;
@@ -664,13 +664,11 @@ void applyKV(String k, String v, AdminResult &ar){
     if (setClockFromEpoch((time_t)e)){ ar.msg="epoch"; }
     else { ar.ok=false; ar.msg="epoch bad"; }
   }
-  else if (k=="tz") {       // e.g. tz=EST5EDT,M3.2.0/2,M11.1.0/2
-    if (v.length()){
-      SET_TZ = v; saveAll();
-      setenv("TZ", SET_TZ.c_str(), 1); tzset();
-      ar.msg="tz";
-    } else { ar.ok=false; ar.msg="tz empty"; }
+  else if (k=="tz") { 
+    if (v.length()>2) { SET_TZ=v; setenv("TZ", SET_TZ.c_str(), 1); tzset(); ar.msg="tz"; } 
+    else { ar.ok=false; ar.msg="tz invalid"; }
   }
+
 
   else { ar.ok=false; ar.msg = "unk key: "+k; }
 }
